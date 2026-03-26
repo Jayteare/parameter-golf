@@ -60,6 +60,7 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
+    model_kind = os.environ.get("MODEL_KIND", "gpt").strip().lower()
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
@@ -70,14 +71,18 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
-    # Bigram hash embedding.
-    bigram_buckets = int(os.environ.get("BIGRAM_BUCKETS", 0))  # 0 = disabled; try 4096
-    bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
-    bigram_lr = float(os.environ.get("BIGRAM_LR", 0.6))
-
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
+    markov_lr = float(os.environ.get("MARKOV_LR", os.environ.get("HEAD_LR", "0.008")))
+    markov_mix_init = float(os.environ.get("MARKOV_MIX_INIT", 0.5))
+    markov2_buckets = int(os.environ.get("MARKOV2_BUCKETS", 0))
+    markov2_lr = float(os.environ.get("MARKOV2_LR", os.environ.get("MARKOV_LR", os.environ.get("HEAD_LR", "0.008"))))
+    markov2_mix_init = float(os.environ.get("MARKOV2_MIX_INIT", 0.05))
+    markov_gate_threshold = float(os.environ.get("MARKOV_GATE_THRESHOLD", 0.20))
+    markov_gate_temp = float(os.environ.get("MARKOV_GATE_TEMP", 0.05))
+    markov2_gate_threshold = float(os.environ.get("MARKOV2_GATE_THRESHOLD", 0.20))
+    markov2_gate_temp = float(os.environ.get("MARKOV2_GATE_TEMP", 0.05))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
@@ -650,35 +655,6 @@ class Block(nn.Module):
         return x
 
 
-class BigramHashEmbedding(nn.Module):
-    """Hash consecutive token pairs into a learned embedding table.
-
-    Maps (prev_token, cur_token) → bucket via a simple hash, looks up a learned
-    embedding, projects to model_dim, and scales by a learnable scalar.  Gives
-    the model cheap local bigram information before attention kicks in.
-    """
-
-    def __init__(self, num_buckets: int, bigram_dim: int, model_dim: int):
-        super().__init__()
-        self.num_buckets = num_buckets
-        self.embed = nn.Embedding(num_buckets, bigram_dim)
-        nn.init.normal_(self.embed.weight, std=0.01)
-        self.proj = CastedLinear(bigram_dim, model_dim, bias=False)
-        self.proj._zero_init = True  # will be zeroed in GPT._init_weights
-
-    def _hash(self, tokens: Tensor) -> Tensor:
-        t = tokens.to(torch.int64)
-        bsz, seqlen = t.shape
-        prev = torch.cat(
-            [torch.zeros(bsz, 1, dtype=t.dtype, device=t.device), t[:, :-1]], dim=1
-        )
-        return ((prev * 92821 + t) % self.num_buckets).long()
-
-    def forward(self, input_ids: Tensor) -> Tensor:
-        h = self.embed(self._hash(input_ids))
-        return self.proj(h)
-
-
 class GPT(nn.Module):
     def __init__(
         self,
@@ -693,8 +669,6 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        bigram_buckets: int = 0,
-        bigram_dim: int = 128,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -703,11 +677,6 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.bigram = (
-            BigramHashEmbedding(bigram_buckets, bigram_dim, model_dim)
-            if bigram_buckets > 0
-            else None
-        )
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -738,10 +707,8 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
-        if self.bigram is not None:
-            x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -756,14 +723,149 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        targets = target_ids.reshape(-1)
+        logits = self.forward_logits(input_ids)
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
+
+
+class MarkovLM(nn.Module):
+    # First-order Markov language model: one logits row per previous token.
+    def __init__(self, vocab_size: int, logit_softcap: float):
+        super().__init__()
+        if logit_softcap <= 0.0:
+            raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        self.logit_softcap = logit_softcap
+        self.transition_logits = nn.Parameter(torch.zeros(vocab_size, vocab_size, dtype=torch.float32))
+
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
+        prev_ids = input_ids.reshape(-1)
+        logits_proj = self.transition_logits[prev_ids]
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        targets = target_ids.reshape(-1)
+        logits = self.forward_logits(input_ids)
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
+
+
+class HashedMarkov2LM(nn.Module):
+    # Hash the previous two tokens into buckets to approximate an order-2 Markov table.
+    def __init__(self, vocab_size: int, num_buckets: int, logit_softcap: float):
+        super().__init__()
+        if logit_softcap <= 0.0:
+            raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if num_buckets <= 0:
+            raise ValueError(f"num_buckets must be positive, got {num_buckets}")
+        self.logit_softcap = logit_softcap
+        self.num_buckets = num_buckets
+        self.transition_logits = nn.Parameter(torch.zeros(num_buckets, vocab_size, dtype=torch.float32))
+
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
+        if input_ids.ndim != 2:
+            raise ValueError(f"HashedMarkov2LM expects [batch, seq] input_ids, got shape={tuple(input_ids.shape)}")
+        batch_size, seq_len = input_ids.shape
+        prev1 = input_ids.to(dtype=torch.int64)
+        prev2 = torch.roll(prev1, shifts=1, dims=1)
+        prev2[:, 0] = 0
+        hashed = ((prev2 * 1_000_003) ^ (prev1 * 92_821)) % self.num_buckets
+        logits_proj = self.transition_logits[hashed.reshape(-1)]
+        if seq_len > 0:
+            logits_proj = logits_proj.reshape(batch_size, seq_len, -1)
+            logits_proj[:, 0, :] = 0
+            logits_proj = logits_proj.reshape(-1, logits_proj.size(-1))
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        targets = target_ids.reshape(-1)
+        logits = self.forward_logits(input_ids)
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
+
+
+class GPTMarkovMixLM(nn.Module):
+    # Add GPT logits to optional order-1 and hashed order-2 Markov residuals.
+    def __init__(
+        self,
+        vocab_size: int,
+        num_layers: int,
+        model_dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: int,
+        tie_embeddings: bool,
+        tied_embed_init_std: float,
+        logit_softcap: float,
+        rope_base: float,
+        qk_gain_init: float,
+        markov_mix_init: float,
+        markov2_buckets: int,
+        markov2_mix_init: float,
+        markov_gate_threshold: float,
+        markov_gate_temp: float,
+        markov2_gate_threshold: float,
+        markov2_gate_temp: float,
+    ):
+        super().__init__()
+        self.gpt = GPT(
+            vocab_size=vocab_size,
+            num_layers=num_layers,
+            model_dim=model_dim,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            mlp_mult=mlp_mult,
+            tie_embeddings=tie_embeddings,
+            tied_embed_init_std=tied_embed_init_std,
+            logit_softcap=logit_softcap,
+            rope_base=rope_base,
+            qk_gain_init=qk_gain_init,
+        )
+        self.markov = MarkovLM(vocab_size=vocab_size, logit_softcap=logit_softcap)
+        self.markov_mix = nn.Parameter(torch.tensor(float(markov_mix_init), dtype=torch.float32))
+        self.markov_gate_threshold = float(markov_gate_threshold)
+        self.markov_gate_temp = max(float(markov_gate_temp), 1e-6)
+        self.markov2 = (
+            HashedMarkov2LM(vocab_size=vocab_size, num_buckets=markov2_buckets, logit_softcap=logit_softcap)
+            if markov2_buckets > 0
+            else None
+        )
+        self.markov2_mix = (
+            nn.Parameter(torch.tensor(float(markov2_mix_init), dtype=torch.float32))
+            if self.markov2 is not None
+            else None
+        )
+        self.markov2_gate_threshold = float(markov2_gate_threshold)
+        self.markov2_gate_temp = max(float(markov2_gate_temp), 1e-6)
+
+    @staticmethod
+    def _confidence_gate(logits: Tensor, threshold: float, temp: float) -> Tensor:
+        probs = torch.softmax(logits.float(), dim=-1)
+        top_prob = probs.amax(dim=-1, keepdim=True)
+        return torch.sigmoid((top_prob - threshold) / temp).to(dtype=logits.dtype)
+
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
+        logits = self.gpt.forward_logits(input_ids)
+        markov_logits = self.markov.forward_logits(input_ids)
+        markov_gate = self._confidence_gate(markov_logits, self.markov_gate_threshold, self.markov_gate_temp)
+        logits = logits + self.markov_mix.to(dtype=torch.float32) * markov_gate * markov_logits
+        if self.markov2 is not None:
+            if self.markov2_mix is None:
+                raise RuntimeError("markov2_mix is required when markov2 is enabled")
+            markov2_logits = self.markov2.forward_logits(input_ids)
+            markov2_gate = self._confidence_gate(markov2_logits, self.markov2_gate_threshold, self.markov2_gate_temp)
+            logits = logits + self.markov2_mix.to(dtype=torch.float32) * markov2_gate * markov2_logits
+        return logits
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        targets = target_ids.reshape(-1)
+        logits = self.forward_logits(input_ids)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
@@ -776,6 +878,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.model_kind not in {"gpt", "markov", "gpt_markov"}:
+        raise ValueError(f"Unsupported MODEL_KIND={args.model_kind}; expected 'gpt', 'markov', or 'gpt_markov'")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -866,101 +970,160 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
-    base_model = GPT(
-        vocab_size=args.vocab_size,
-        num_layers=args.num_layers,
-        model_dim=args.model_dim,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        mlp_mult=args.mlp_mult,
-        tie_embeddings=args.tie_embeddings,
-        tied_embed_init_std=args.tied_embed_init_std,
-        logit_softcap=args.logit_softcap,
-        rope_base=args.rope_base,
-        qk_gain_init=args.qk_gain_init,
-        bigram_buckets=args.bigram_buckets,
-        bigram_dim=args.bigram_dim,
-    ).to(device).bfloat16()
-    for module in base_model.modules():
-        if isinstance(module, CastedLinear):
-            module.float()
-    restore_low_dim_params_to_fp32(base_model)
+    if args.model_kind == "markov":
+        base_model = MarkovLM(
+            vocab_size=args.vocab_size,
+            logit_softcap=args.logit_softcap,
+        ).to(device)
+    elif args.model_kind == "gpt_markov":
+        base_model = GPTMarkovMixLM(
+            vocab_size=args.vocab_size,
+            num_layers=args.num_layers,
+            model_dim=args.model_dim,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            mlp_mult=args.mlp_mult,
+            tie_embeddings=args.tie_embeddings,
+            tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap,
+            rope_base=args.rope_base,
+            qk_gain_init=args.qk_gain_init,
+            markov_mix_init=args.markov_mix_init,
+            markov2_buckets=args.markov2_buckets,
+            markov2_mix_init=args.markov2_mix_init,
+            markov_gate_threshold=args.markov_gate_threshold,
+            markov_gate_temp=args.markov_gate_temp,
+            markov2_gate_threshold=args.markov2_gate_threshold,
+            markov2_gate_temp=args.markov2_gate_temp,
+        ).to(device).bfloat16()
+    else:
+        base_model = GPT(
+            vocab_size=args.vocab_size,
+            num_layers=args.num_layers,
+            model_dim=args.model_dim,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            mlp_mult=args.mlp_mult,
+            tie_embeddings=args.tie_embeddings,
+            tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap,
+            rope_base=args.rope_base,
+            qk_gain_init=args.qk_gain_init,
+        ).to(device).bfloat16()
+    if args.model_kind != "markov":
+        if args.model_kind == "gpt_markov":
+            base_model.markov.float()
+            if base_model.markov2 is not None:
+                base_model.markov2.float()
+        for module in base_model.modules():
+            if isinstance(module, CastedLinear):
+                module.float()
+        restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    # Optimizer split:
-    # - token embedding (Adam) uses EMBED_LR
-    # - untied lm_head (Adam) uses HEAD_LR
-    # - matrix params in transformer blocks use MATRIX_LR via Muon
-    # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
-    matrix_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    scalar_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
-    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
-    optimizer_muon = Muon(
-        matrix_params,
-        lr=args.matrix_lr,
-        momentum=args.muon_momentum,
-        backend_steps=args.muon_backend_steps,
-    )
-    for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    if base_model.bigram is not None:
-        bigram_embed_params = [base_model.bigram.embed.weight]
-        bigram_matrix_params = [base_model.bigram.proj.weight]
-        optimizer_bigram_embed = torch.optim.Adam(
-            [{"params": bigram_embed_params, "lr": args.bigram_lr, "base_lr": args.bigram_lr}],
+    optimizer_muon: Muon | None = None
+    if args.model_kind == "markov":
+        optimizer_markov = torch.optim.Adam(
+            [{"params": [base_model.transition_logits], "lr": args.markov_lr, "base_lr": args.markov_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
         )
-        optimizers.append(optimizer_bigram_embed)
-        # proj weight is a 2-D matrix → use Muon
-        optimizer_muon.add_param_group({"params": bigram_matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr})
-    if base_model.lm_head is not None:
-        optimizer_head = torch.optim.Adam(
-            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+        optimizers: list[torch.optim.Optimizer] = [optimizer_markov]
+    else:
+        gpt_model = base_model.gpt if args.model_kind == "gpt_markov" else base_model
+        # Optimizer split:
+        # - token embedding (Adam) uses EMBED_LR
+        # - untied lm_head (Adam) uses HEAD_LR
+        # - matrix params in transformer blocks use MATRIX_LR via Muon
+        # - vectors/scalars use SCALAR_LR via Adam
+        block_named_params = list(gpt_model.blocks.named_parameters())
+        matrix_params = [
+            p
+            for name, p in block_named_params
+            if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        ]
+        scalar_params = [
+            p
+            for name, p in block_named_params
+            if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        ]
+        if gpt_model.skip_weights.numel() > 0:
+            scalar_params.append(gpt_model.skip_weights)
+        if args.model_kind == "gpt_markov":
+            scalar_params.append(base_model.markov_mix)
+            if base_model.markov2_mix is not None:
+                scalar_params.append(base_model.markov2_mix)
+        token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+        optimizer_tok = torch.optim.Adam(
+            [{"params": [gpt_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
         )
-        optimizers.insert(1, optimizer_head)
+        optimizer_muon = Muon(
+            matrix_params,
+            lr=args.matrix_lr,
+            momentum=args.muon_momentum,
+            backend_steps=args.muon_backend_steps,
+        )
+        for group in optimizer_muon.param_groups:
+            group["base_lr"] = args.matrix_lr
+        optimizer_scalar = torch.optim.Adam(
+            [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers = [optimizer_tok, optimizer_muon, optimizer_scalar]
+        if gpt_model.lm_head is not None:
+            optimizer_head = torch.optim.Adam(
+                [{"params": [gpt_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+                betas=(args.beta1, args.beta2),
+                eps=args.adam_eps,
+                fused=True,
+            )
+            optimizers.insert(1, optimizer_head)
+        if args.model_kind == "gpt_markov":
+            optimizer_markov = torch.optim.Adam(
+                [{"params": [base_model.markov.transition_logits], "lr": args.markov_lr, "base_lr": args.markov_lr}],
+                betas=(args.beta1, args.beta2),
+                eps=args.adam_eps,
+                fused=True,
+            )
+            optimizers.append(optimizer_markov)
+            if base_model.markov2 is not None:
+                optimizer_markov2 = torch.optim.Adam(
+                    [{"params": [base_model.markov2.transition_logits], "lr": args.markov2_lr, "base_lr": args.markov2_lr}],
+                    betas=(args.beta1, args.beta2),
+                    eps=args.adam_eps,
+                    fused=True,
+                )
+                optimizers.append(optimizer_markov2)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    log0(f"model_kind:{args.model_kind}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
-    log0(
-        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
-        f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
-    )
-    if base_model.bigram is not None:
-        log0(f"bigram_hash:enabled buckets:{args.bigram_buckets} dim:{args.bigram_dim} lr:{args.bigram_lr}")
+    if args.model_kind == "markov":
+        log0(f"markov_lr:{args.markov_lr}")
+    else:
+        log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+        log0(
+            f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
+            f"head_lr:{args.head_lr if gpt_model.lm_head is not None else 0.0} "
+            f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        )
+        if args.model_kind == "gpt_markov":
+            log0(
+                f"markov_lr:{args.markov_lr} markov_mix_init:{args.markov_mix_init} "
+                f"markov_gate_threshold:{args.markov_gate_threshold} markov_gate_temp:{args.markov_gate_temp} "
+                f"markov2_buckets:{args.markov2_buckets} markov2_lr:{args.markov2_lr} "
+                f"markov2_mix_init:{args.markov2_mix_init} markov2_gate_threshold:{args.markov2_gate_threshold} "
+                f"markov2_gate_temp:{args.markov2_gate_temp}"
+            )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1077,10 +1240,11 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        for group in optimizer_muon.param_groups:
-            group["momentum"] = muon_momentum
+        if optimizer_muon is not None:
+            frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+            muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+            for group in optimizer_muon.param_groups:
+                group["momentum"] = muon_momentum
 
         for opt in optimizers:
             for group in opt.param_groups:

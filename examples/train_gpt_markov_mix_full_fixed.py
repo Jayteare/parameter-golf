@@ -70,11 +70,6 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
-    # Bigram hash embedding.
-    bigram_buckets = int(os.environ.get("BIGRAM_BUCKETS", 0))  # 0 = disabled; try 4096
-    bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
-    bigram_lr = float(os.environ.get("BIGRAM_LR", 0.6))
-
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -90,6 +85,17 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+    # Optional BigramHash / Markov-style auxiliary bias.
+    bigramhash_enable = bool(int(os.environ.get("BIGRAMHASH_ENABLE", "0")))
+    bigramhash_num_buckets = int(os.environ.get("BIGRAMHASH_NUM_BUCKETS", 8192))
+    bigramhash_slots = int(os.environ.get("BIGRAMHASH_SLOTS", 4))
+    bigramhash_scale_init = float(os.environ.get("BIGRAMHASH_SCALE_INIT", 0.04))
+    bigramhash_gate_margin_init = float(os.environ.get("BIGRAMHASH_GATE_MARGIN_INIT", 0.10))
+    bigramhash_gate_temp_init = float(os.environ.get("BIGRAMHASH_GATE_TEMP_INIT", 0.05))
+    bigramhash_ema_decay = float(os.environ.get("BIGRAMHASH_EMA_DECAY", 0.995))
+    bigramhash_min_count = float(os.environ.get("BIGRAMHASH_MIN_COUNT", 2.0))
+    bigramhash_hash_seed = int(os.environ.get("BIGRAMHASH_HASH_SEED", 17))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -565,6 +571,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        bigramhash: BigramHashMemory | None = None,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -650,33 +657,125 @@ class Block(nn.Module):
         return x
 
 
-class BigramHashEmbedding(nn.Module):
-    """Hash consecutive token pairs into a learned embedding table.
-
-    Maps (prev_token, cur_token) → bucket via a simple hash, looks up a learned
-    embedding, projects to model_dim, and scales by a learnable scalar.  Gives
-    the model cheap local bigram information before attention kicks in.
+class BigramHashMemory(nn.Module):
     """
+    Tiny hashed bigram memory used as an auxiliary logits bias.
 
-    def __init__(self, num_buckets: int, bigram_dim: int, model_dim: int):
+    For each hashed previous-token bucket we retain a small number of candidate
+    next tokens and exponentially-smoothed counts. At inference we turn those
+    counts into a sparse logits bias that is blended with the GPT logits.
+
+    This is intentionally simple and byte-cheap:
+    - token ids are stored as int16
+    - counts are stored as fp16
+    - per-bucket slots are kept tiny
+    """
+    def __init__(
+        self,
+        vocab_size: int,
+        num_buckets: int,
+        slots: int,
+        ema_decay: float,
+        min_count: float,
+        hash_seed: int,
+        scale_init: float,
+        gate_margin_init: float,
+        gate_temp_init: float,
+    ):
         super().__init__()
+        if vocab_size > 65535:
+            raise ValueError("BigramHashMemory expects VOCAB_SIZE <= 65535")
+        self.vocab_size = vocab_size
         self.num_buckets = num_buckets
-        self.embed = nn.Embedding(num_buckets, bigram_dim)
-        nn.init.normal_(self.embed.weight, std=0.01)
-        self.proj = CastedLinear(bigram_dim, model_dim, bias=False)
-        self.proj._zero_init = True  # will be zeroed in GPT._init_weights
+        self.slots = slots
+        self.ema_decay = ema_decay
+        self.min_count = min_count
+        self.hash_seed = hash_seed
 
-    def _hash(self, tokens: Tensor) -> Tensor:
-        t = tokens.to(torch.int64)
-        bsz, seqlen = t.shape
-        prev = torch.cat(
-            [torch.zeros(bsz, 1, dtype=t.dtype, device=t.device), t[:, :-1]], dim=1
+        self.markov_scale = nn.Parameter(torch.tensor(scale_init, dtype=torch.float32))
+        self.gate_margin = nn.Parameter(torch.tensor(gate_margin_init, dtype=torch.float32))
+        self.gate_temp = nn.Parameter(torch.tensor(gate_temp_init, dtype=torch.float32))
+
+        self.register_buffer(
+            "token_ids",
+            torch.full((num_buckets, slots), -1, dtype=torch.int16),
+            persistent=True,
         )
-        return ((prev * 92821 + t) % self.num_buckets).long()
+        self.register_buffer(
+            "counts",
+            torch.zeros((num_buckets, slots), dtype=torch.float16),
+            persistent=True,
+        )
 
-    def forward(self, input_ids: Tensor) -> Tensor:
-        h = self.embed(self._hash(input_ids))
-        return self.proj(h)
+    def bucketize(self, prev_ids: Tensor) -> Tensor:
+        h = (prev_ids.to(torch.int64) * 0x9E3779B1 + self.hash_seed) & 0x7FFFFFFF
+        return torch.remainder(h, self.num_buckets).to(torch.long)
+
+    @torch.no_grad()
+    def update_from_bigrams(self, prev_ids: Tensor, next_ids: Tensor) -> None:
+        if prev_ids.numel() == 0:
+            return
+        device = self.token_ids.device
+        buckets = self.bucketize(prev_ids.reshape(-1).to(device))
+        next_ids = next_ids.reshape(-1).to(device=device, dtype=torch.long)
+
+        touched = torch.unique(buckets)
+        self.counts[touched] *= self.ema_decay
+
+        for b, tok in zip(buckets.tolist(), next_ids.tolist()):
+            row_tokens = self.token_ids[b]
+            row_counts = self.counts[b]
+
+            hit = (row_tokens == tok).nonzero(as_tuple=False)
+            if hit.numel() > 0:
+                idx = int(hit[0, 0])
+                row_counts[idx] = row_counts[idx] + 1.0
+                continue
+
+            empty = (row_tokens < 0).nonzero(as_tuple=False)
+            if empty.numel() > 0:
+                idx = int(empty[0, 0])
+                row_tokens[idx] = tok
+                row_counts[idx] = 1.0
+                continue
+
+            min_idx = int(torch.argmin(row_counts).item())
+            if float(row_counts[min_idx].item()) < 1.0:
+                row_tokens[min_idx] = tok
+                row_counts[min_idx] = 1.0
+            else:
+                row_counts[min_idx] = row_counts[min_idx] + 0.05
+
+    def build_bias(self, prev_ids_flat: Tensor, out_dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+        device = prev_ids_flat.device
+        n = prev_ids_flat.numel()
+        sparse_bias = torch.zeros((n, self.vocab_size), device=device, dtype=out_dtype)
+
+        buckets = self.bucketize(prev_ids_flat).to(device)
+        row_token_ids = self.token_ids[buckets].to(device=device, dtype=torch.long)
+        row_counts = self.counts[buckets].to(device=device, dtype=torch.float32)
+
+        valid = (row_token_ids >= 0) & (row_counts >= self.min_count)
+        safe_counts = torch.where(valid, row_counts, torch.zeros_like(row_counts))
+        denom = safe_counts.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        probs = safe_counts / denom
+
+        top2 = torch.topk(probs, k=min(2, probs.size(1)), dim=1).values
+        if top2.size(1) == 1:
+            margin = top2[:, 0]
+        else:
+            margin = top2[:, 0] - top2[:, 1]
+        gate_temp = self.gate_temp.clamp_min(1e-4).to(device)
+        gate = torch.sigmoid((margin - self.gate_margin.to(device)) / gate_temp)[:, None].to(dtype=out_dtype)
+
+        valid_indices = valid.nonzero(as_tuple=False)
+        if valid_indices.numel() > 0:
+            rows = valid_indices[:, 0]
+            cols = row_token_ids[rows, valid_indices[:, 1]]
+            vals = torch.log(probs[rows, valid_indices[:, 1]].clamp_min(1e-8)).to(out_dtype)
+            sparse_bias[rows, cols] = vals
+
+        return sparse_bias, gate
 
 
 class GPT(nn.Module):
@@ -693,8 +792,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        bigram_buckets: int = 0,
-        bigram_dim: int = 128,
+        bigramhash: BigramHashMemory | None = None,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -702,12 +800,8 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.bigramhash = bigramhash
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.bigram = (
-            BigramHashEmbedding(bigram_buckets, bigram_dim, model_dim)
-            if bigram_buckets > 0
-            else None
-        )
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -738,10 +832,8 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def _compute_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
-        if self.bigram is not None:
-            x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -755,8 +847,7 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
+        x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
@@ -764,7 +855,26 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+        if self.bigramhash is not None:
+            prev_ids_flat = input_ids.reshape(-1)
+            markov_bias, gate = self.bigramhash.build_bias(prev_ids_flat, out_dtype=logits.dtype)
+            markov_bias = markov_bias.view_as(logits)
+            gate = gate.view(logits.shape[0], logits.shape[1], 1)
+            logits = logits + gate * self.bigramhash.markov_scale.to(dtype=logits.dtype) * markov_bias
+
+        return logits
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        logits = self._compute_logits(input_ids).reshape(-1, self.tok_emb.num_embeddings)
+        targets = target_ids.reshape(-1)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
+
+    @torch.no_grad()
+    def update_markov_memory_from_batch(self, input_ids: Tensor, target_ids: Tensor) -> None:
+        if self.bigramhash is None:
+            return
+        self.bigramhash.update_from_bigrams(input_ids.reshape(-1), target_ids.reshape(-1))
 
 
 # -----------------------------
@@ -866,6 +976,20 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
+    bigramhash = None
+    if args.bigramhash_enable:
+        bigramhash = BigramHashMemory(
+            vocab_size=args.vocab_size,
+            num_buckets=args.bigramhash_num_buckets,
+            slots=args.bigramhash_slots,
+            ema_decay=args.bigramhash_ema_decay,
+            min_count=args.bigramhash_min_count,
+            hash_seed=args.bigramhash_hash_seed,
+            scale_init=args.bigramhash_scale_init,
+            gate_margin_init=args.bigramhash_gate_margin_init,
+            gate_temp_init=args.bigramhash_gate_temp_init,
+        )
+
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -878,8 +1002,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        bigram_buckets=args.bigram_buckets,
-        bigram_dim=args.bigram_dim,
+        bigramhash=bigramhash,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -906,6 +1029,12 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    if base_model.bigramhash is not None:
+        scalar_params.extend([
+            base_model.bigramhash.markov_scale,
+            base_model.bigramhash.gate_margin,
+            base_model.bigramhash.gate_temp,
+        ])
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -928,18 +1057,6 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    if base_model.bigram is not None:
-        bigram_embed_params = [base_model.bigram.embed.weight]
-        bigram_matrix_params = [base_model.bigram.proj.weight]
-        optimizer_bigram_embed = torch.optim.Adam(
-            [{"params": bigram_embed_params, "lr": args.bigram_lr, "base_lr": args.bigram_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers.append(optimizer_bigram_embed)
-        # proj weight is a 2-D matrix → use Muon
-        optimizer_muon.add_param_group({"params": bigram_matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr})
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -959,14 +1076,19 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    if base_model.bigram is not None:
-        log0(f"bigram_hash:enabled buckets:{args.bigram_buckets} dim:{args.bigram_dim} lr:{args.bigram_lr}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(
+        f"bigramhash_enable:{args.bigramhash_enable} "
+        f"buckets:{args.bigramhash_num_buckets} slots:{args.bigramhash_slots} "
+        f"scale_init:{args.bigramhash_scale_init} gate_margin_init:{args.bigramhash_gate_margin_init} "
+        f"gate_temp_init:{args.bigramhash_gate_temp_init} ema_decay:{args.bigramhash_ema_decay} "
+        f"min_count:{args.bigramhash_min_count}"
+    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1006,6 +1128,8 @@ def main() -> None:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
+                with torch.no_grad():
+                    base_model.update_markov_memory_from_batch(x, y)
             for opt in optimizers:
                 opt.step()
             zero_grad_all()
@@ -1075,6 +1199,8 @@ def main() -> None:
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
+            with torch.no_grad():
+                base_model.update_markov_memory_from_batch(x, y)
         train_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
