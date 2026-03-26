@@ -70,6 +70,11 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
+    # Bigram hash embedding.
+    bigram_buckets = int(os.environ.get("BIGRAM_BUCKETS", 0))  # 0 = disabled; try 4096
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
+    bigram_lr = float(os.environ.get("BIGRAM_LR", 0.6))
+
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -645,6 +650,35 @@ class Block(nn.Module):
         return x
 
 
+class BigramHashEmbedding(nn.Module):
+    """Hash consecutive token pairs into a learned embedding table.
+
+    Maps (prev_token, cur_token) → bucket via a simple hash, looks up a learned
+    embedding, projects to model_dim, and scales by a learnable scalar.  Gives
+    the model cheap local bigram information before attention kicks in.
+    """
+
+    def __init__(self, num_buckets: int, bigram_dim: int, model_dim: int):
+        super().__init__()
+        self.num_buckets = num_buckets
+        self.embed = nn.Embedding(num_buckets, bigram_dim)
+        nn.init.normal_(self.embed.weight, std=0.01)
+        self.proj = CastedLinear(bigram_dim, model_dim, bias=False)
+        self.proj._zero_init = True  # will be zeroed in GPT._init_weights
+
+    def _hash(self, tokens: Tensor) -> Tensor:
+        t = tokens.to(torch.int64)
+        bsz, seqlen = t.shape
+        prev = torch.cat(
+            [torch.zeros(bsz, 1, dtype=t.dtype, device=t.device), t[:, :-1]], dim=1
+        )
+        return ((prev * 92821 + t) % self.num_buckets).long()
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        h = self.embed(self._hash(input_ids))
+        return self.proj(h)
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -659,6 +693,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        bigram_buckets: int = 0,
+        bigram_dim: int = 128,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -667,6 +703,11 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.bigram = (
+            BigramHashEmbedding(bigram_buckets, bigram_dim, model_dim)
+            if bigram_buckets > 0
+            else None
+        )
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -699,6 +740,8 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        if self.bigram is not None:
+            x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -835,6 +878,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        bigram_buckets=args.bigram_buckets,
+        bigram_dim=args.bigram_dim,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -883,6 +928,18 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if base_model.bigram is not None:
+        bigram_embed_params = [base_model.bigram.embed.weight]
+        bigram_matrix_params = [base_model.bigram.proj.weight]
+        optimizer_bigram_embed = torch.optim.Adam(
+            [{"params": bigram_embed_params, "lr": args.bigram_lr, "base_lr": args.bigram_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_bigram_embed)
+        # proj weight is a 2-D matrix → use Muon
+        optimizer_muon.add_param_group({"params": bigram_matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr})
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -902,6 +959,8 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    if base_model.bigram is not None:
+        log0(f"bigram_hash:enabled buckets:{args.bigram_buckets} dim:{args.bigram_dim} lr:{args.bigram_lr}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
