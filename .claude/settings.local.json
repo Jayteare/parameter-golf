@@ -6,7 +6,8 @@
       "Bash(git add:*)",
       "Bash(git commit:*)",
       "Bash(git push:*)",
-      "Bash(echo \"experiments/:*)"
+      "Bash(echo \"experiments/:*)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''experiments/best/train_gpt_markov_gated_bigramhash.py'', doraise=True\\); print\\(''OK''\\)\")"
     ]
   }
 }
