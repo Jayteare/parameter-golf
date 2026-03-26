@@ -311,6 +311,9 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
+# Keep the Markov transition table in fp16 instead of int8 to preserve
+# learned bigram statistics that are highly sensitive to quantization noise.
+INT8_KEEP_FLOAT_NAME_PATTERNS = ("transition_logits",)
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
@@ -380,7 +383,11 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
 
         # Small float tensors are cheap enough to keep directly. We still downcast
         # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+        # Also keep Markov transition tables in fp16 — they're highly sensitive to
+        # quantization noise and the size cost (~2MB fp16 vs ~1MB int8) is worth it.
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or any(
+            pattern in name for pattern in INT8_KEEP_FLOAT_NAME_PATTERNS
+        ):
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
