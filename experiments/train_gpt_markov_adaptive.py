@@ -392,11 +392,13 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
 
         # Small float tensors are cheap enough to keep directly. We still downcast
         # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
-        # Also keep Markov transition tables in fp16 — they're highly sensitive to
-        # quantization noise and the size cost (~2MB fp16 vs ~1MB int8) is worth it.
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or any(
+        # Force int8 for markov.transition_logits to reduce packed artifact size,
+        # even though it would normally match INT8_KEEP_FLOAT_NAME_PATTERNS.
+        force_int8_substrings = ("markov.transition_logits",)
+        keep_float_by_name = any(
             pattern in name for pattern in INT8_KEEP_FLOAT_NAME_PATTERNS
-        ):
+        ) and not any(s in name for s in force_int8_substrings)
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or keep_float_by_name:
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
