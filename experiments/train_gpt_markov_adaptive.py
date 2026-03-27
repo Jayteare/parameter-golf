@@ -101,6 +101,10 @@ class Hyperparameters:
     qat_every = int(os.environ.get("QAT_EVERY", 25))  # Apply QAT noise every N steps
     qat_noise_scale = float(os.environ.get("QAT_NOISE_SCALE", 0.5))  # Fraction of quant step size for noise
 
+    # EMA settings - exponential moving average of model weights
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.95))  # EMA decay rate (0 = disabled)
+    ema_start_step = int(os.environ.get("EMA_START_STEP", 50))  # Start EMA after this many steps
+
 # -----------------------------
 # MUON OPTIMIZER
 # -----------------------------
@@ -1196,6 +1200,7 @@ def main() -> None:
             f"qat_start_frac:{args.qat_start_frac} qat_every:{args.qat_every} "
             f"qat_noise_scale:{args.qat_noise_scale}"
         )
+        log0(f"ema_decay:{args.ema_decay} ema_start_step:{args.ema_start_step}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1257,6 +1262,11 @@ def main() -> None:
     # -----------------------------
     # MAIN TRAINING LOOP
     # -----------------------------
+
+    # EMA: keep a shadow copy of model weights
+    ema_state: dict[str, Tensor] | None = None
+    if args.ema_decay > 0:
+        ema_state = {name: tensor.detach().clone() for name, tensor in base_model.state_dict().items()}
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
@@ -1338,6 +1348,12 @@ def main() -> None:
             if step >= qat_start_step and step % args.qat_every == 0:
                 apply_qat_noise(base_model, args.qat_noise_scale)
 
+        # EMA update: exponential moving average of model weights
+        if ema_state is not None and step >= args.ema_start_step:
+            with torch.no_grad():
+                for name, param in base_model.state_dict().items():
+                    ema_state[name].lerp_(param.to(ema_state[name].dtype), 1.0 - args.ema_decay)
+
         should_log_train = (
             args.train_log_every > 0
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
@@ -1367,6 +1383,11 @@ def main() -> None:
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
+
+    # Swap in EMA weights for serialization and evaluation
+    if ema_state is not None:
+        log0("Using EMA weights for final model")
+        base_model.load_state_dict(ema_state, strict=True)
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
