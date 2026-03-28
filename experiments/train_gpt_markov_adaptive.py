@@ -332,6 +332,142 @@ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
+# -----------------------------
+# INT6 MIXED QUANTIZATION
+# -----------------------------
+# Int6 per-row quantization for MLP/attention weights, int8 for embeddings,
+# fp16 passthrough for small/control tensors.  Values are stored as int8 but
+# clamped to [-32, 31] (6-bit range); zstd-22 recovers the wasted 2 bits/byte.
+
+INT6_CLIP_RANGE = 31  # signed 6-bit: [-32, 31]
+INT6_LARGE_TENSOR_PATTERNS = (".attn.", ".mlp.")  # route to int6
+INT6_PASSTHROUGH_NAME_PATTERNS = CONTROL_TENSOR_NAME_PATTERNS
+
+try:
+    import zstandard as _zstd
+    def _compress_zstd(data: bytes) -> bytes:
+        return _zstd.ZstdCompressor(level=22).compress(data)
+    def _decompress_zstd(data: bytes) -> bytes:
+        return _zstd.ZstdDecompressor().decompress(data)
+    _HAS_ZSTD = True
+except ImportError:
+    _HAS_ZSTD = False
+    def _compress_zstd(data: bytes) -> bytes:
+        raise RuntimeError("zstandard not installed")
+    def _decompress_zstd(data: bytes) -> bytes:
+        raise RuntimeError("zstandard not installed")
+
+
+def quantize_int6_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
+    """Quantize a float tensor to 6-bit range [-32, 31], stored as int8."""
+    t32 = t.float()
+    if t32.ndim == 2:
+        row_max = t32.abs().amax(dim=1)
+        scale = (row_max / INT6_CLIP_RANGE).clamp_min(1e-12).to(torch.float16)
+        scale = scale.clamp_min(torch.finfo(torch.float16).tiny)
+        q = torch.clamp(
+            torch.round(t32 / scale.float()[:, None]),
+            -INT6_CLIP_RANGE - 1, INT6_CLIP_RANGE,
+        ).to(torch.int8)
+        return q, scale
+    # 1D / scalar fallback
+    amax = t32.abs().max().item()
+    scale = torch.tensor(max(amax / INT6_CLIP_RANGE, 1e-12), dtype=torch.float16)
+    q = torch.clamp(
+        torch.round(t32 / scale.float()),
+        -INT6_CLIP_RANGE - 1, INT6_CLIP_RANGE,
+    ).to(torch.int8)
+    return q, scale
+
+
+def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
+    """Mixed int6/int8 quantization: MLP+attention get int6, embeddings get int8,
+    small/control tensors stay as fp16 passthrough."""
+    result: dict[str, Tensor] = {}
+    meta: dict[str, str] = {}
+    passthrough_orig_dtypes: dict[str, str] = {}
+    stats = dict.fromkeys(
+        ("param_count", "num_tensors", "int6_tensors", "int8_tensors",
+         "passthrough_tensors", "baseline_bytes", "packed_bytes"),
+        0,
+    )
+
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        stats["param_count"] += int(t.numel())
+        stats["num_tensors"] += 1
+        stats["baseline_bytes"] += tensor_nbytes(t)
+
+        # Non-float: exact passthrough
+        if not t.is_floating_point():
+            result[name] = t
+            meta[name] = "passthrough"
+            stats["packed_bytes"] += tensor_nbytes(t)
+            stats["passthrough_tensors"] += 1
+            continue
+
+        # Small tensors or control tensors: fp16 passthrough
+        is_control = any(p in name for p in INT6_PASSTHROUGH_NAME_PATTERNS)
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or is_control:
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            result[name] = kept
+            meta[name] = "passthrough_fp16"
+            stats["packed_bytes"] += tensor_nbytes(kept)
+            stats["passthrough_tensors"] += 1
+            continue
+
+        # MLP / attention weights: int6
+        is_int6 = any(p in name for p in INT6_LARGE_TENSOR_PATTERNS)
+        if is_int6:
+            q, s = quantize_int6_per_row(t)
+            result[name + ".q"] = q
+            result[name + ".s"] = s
+            meta[name] = "int6"
+            stats["packed_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+            stats["int6_tensors"] += 1
+            continue
+
+        # Everything else (embeddings, Markov table): int8
+        q, s = quantize_float_tensor(t)
+        result[name + ".q"] = q
+        result[name + ".s"] = s
+        meta[name] = "int8"
+        stats["packed_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+        stats["int8_tensors"] += 1
+
+    obj = {"w": result, "m": meta}
+    if passthrough_orig_dtypes:
+        obj["pt_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
+
+def dequantize_state_dict_int6(obj: dict[str, object], template_sd: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Reconstruct float state dict from mixed int6/int8 quantized format."""
+    result_data = obj["w"]
+    meta = obj["m"]
+    pt_dtypes = obj.get("pt_dtypes", {})
+    out: dict[str, Tensor] = {}
+
+    for name, orig in template_sd.items():
+        info = meta.get(name, "passthrough")
+
+        if info.startswith("passthrough"):
+            t = result_data[name]
+            orig_dtype = pt_dtypes.get(name)
+            if isinstance(orig_dtype, str):
+                t = t.to(dtype=getattr(torch, orig_dtype))
+            out[name] = t.contiguous()
+            continue
+
+        q = result_data[name + ".q"]
+        s = result_data[name + ".s"]
+        if s.ndim > 0:  # per-row
+            out[name] = (q.float() * s.float().view(q.shape[0], *([1] * (q.ndim - 1)))).to(orig.dtype).contiguous()
+        else:  # scalar
+            out[name] = (q.float() * float(s.item())).to(orig.dtype).contiguous()
+
+    return out
+
 def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
     if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
         return t.float().contiguous()
@@ -1443,6 +1579,59 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # --- Int6+zstd export (if zstandard is available) ---
+    if _HAS_ZSTD:
+        # Re-load the original (non-quantized) weights for int6 quantization
+        if ema_state is not None:
+            base_model.load_state_dict(ema_state, strict=True)
+        else:
+            base_model.load_state_dict(
+                torch.load("final_model.pt", map_location="cpu"), strict=True
+            )
+
+        sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
+        int6_obj, int6_stats = quantize_state_dict_int6(sd_cpu)
+        int6_buf = io.BytesIO()
+        torch.save(int6_obj, int6_buf)
+        int6_raw = int6_buf.getvalue()
+        int6_blob = _compress_zstd(int6_raw)
+        if master_process:
+            with open("final_model.int6.ptz", "wb") as f:
+                f.write(int6_blob)
+            int6_file_bytes = len(int6_blob)
+            log0(
+                f"Serialized model int6+zstd: {int6_file_bytes} bytes "
+                f"(int6:{int6_stats['int6_tensors']} int8:{int6_stats['int8_tensors']} "
+                f"passthrough:{int6_stats['passthrough_tensors']} "
+                f"packed_payload:{int6_stats['packed_bytes']})"
+            )
+            log0(f"Total submission size int6+zstd: {int6_file_bytes + code_bytes} bytes")
+
+        if distributed:
+            dist.barrier()
+        with open("final_model.int6.ptz", "rb") as f:
+            int6_blob_disk = f.read()
+        int6_state = torch.load(
+            io.BytesIO(_decompress_zstd(int6_blob_disk)), map_location="cpu"
+        )
+        base_model.load_state_dict(
+            dequantize_state_dict_int6(int6_state, sd_cpu), strict=True
+        )
+        torch.cuda.synchronize()
+        t_q6eval = time.perf_counter()
+        q6_val_loss, q6_val_bpb = eval_val(
+            args, model, rank, world_size, device, grad_accum_steps,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_int6_zstd_roundtrip val_loss:{q6_val_loss:.4f} val_bpb:{q6_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_q6eval):.0f}ms"
+        )
+        log0(f"final_int6_zstd_roundtrip_exact val_loss:{q6_val_loss:.8f} val_bpb:{q6_val_bpb:.8f}")
+    else:
+        log0("skipping int6+zstd export (zstandard not installed, pip install zstandard)")
 
     if distributed:
         dist.destroy_process_group()
