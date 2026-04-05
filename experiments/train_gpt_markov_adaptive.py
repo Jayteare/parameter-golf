@@ -421,7 +421,7 @@ def tensor_nbytes(t: Tensor) -> int:
 # fp16 passthrough for small/control tensors.  Values are stored as int8 but
 # clamped to [-32, 31] (6-bit range); zstd-22 recovers the wasted 2 bits/byte.
 
-INT6_CLIP_RANGE = 31  # signed 6-bit: [-32, 31]
+INT6_CLIP_RANGE = int(os.environ.get("INT6_CLIP_RANGE", 31))  # signed 6-bit: [-32, 31], lower = tighter compression
 INT6_LARGE_TENSOR_PATTERNS = (".attn.", ".mlp.")  # route to int6
 INT6_PASSTHROUGH_NAME_PATTERNS = CONTROL_TENSOR_NAME_PATTERNS
 
