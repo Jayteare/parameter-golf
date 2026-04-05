@@ -105,6 +105,14 @@ class Hyperparameters:
     ema_decay = float(os.environ.get("EMA_DECAY", 0.95))  # EMA decay rate (0 = disabled)
     ema_start_step = int(os.environ.get("EMA_START_STEP", 50))  # Start EMA after this many steps
 
+    # SWA settings - stochastic weight averaging over checkpoints during warmdown
+    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "0")))  # 0 = disabled by default
+    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.5))  # Start collecting when lr scale < this
+    swa_every = int(os.environ.get("SWA_EVERY", 50))  # Collect a checkpoint every N steps
+
+    # Sliding window eval settings
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))  # 0 = disabled (use standard eval), >0 = stride for sliding window
+
 # -----------------------------
 # MUON OPTIMIZER
 # -----------------------------
@@ -295,6 +303,80 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_sliding(
+    args: Hyperparameters,
+    base_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    stride: int,
+    batch_seqs: int = 32,
+) -> tuple[float, float]:
+    """Sliding window evaluation with overlapping windows for better bpb scores."""
+    seq_len = args.train_seq_len
+    total_tokens = val_tokens.numel() - 1
+    window_starts = [ws for ws in range(0, total_tokens, stride)
+                     if min(ws + seq_len, total_tokens) - ws >= 1]
+    total_windows = len(window_starts)
+    my_s = (total_windows * rank) // world_size
+    my_e = (total_windows * (rank + 1)) // world_size
+    my_windows = window_starts[my_s:my_e]
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    base_model.eval()
+    with torch.inference_mode():
+        for bi in range(0, len(my_windows), batch_seqs):
+            batch_ws = my_windows[bi:bi + batch_seqs]
+            bsz = len(batch_ws)
+            x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            wlens: list[int] = []
+            for i, ws in enumerate(batch_ws):
+                end = min(ws + seq_len, total_tokens)
+                wlen = end - ws
+                wlens.append(wlen)
+                chunk = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
+                x_batch[i, :wlen] = chunk[:-1]
+                y_batch[i, :wlen] = chunk[1:]
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = base_model.forward_logits(x_batch)
+            nll = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).float(),
+                y_batch.reshape(-1),
+                reduction="none",
+            ).reshape(bsz, seq_len)
+            for i, ws in enumerate(batch_ws):
+                wlen = wlens[i]
+                s = 0 if ws == 0 else max(wlen - stride, 0)
+                scored_nll = nll[i, s:wlen].to(torch.float64)
+                loss_sum += scored_nll.sum()
+                token_count += float(wlen - s)
+                tgt = y_batch[i, s:wlen]
+                prev = x_batch[i, s:wlen]
+                tb = base_bytes_lut[tgt].to(torch.float64)
+                tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+                byte_count += tb.sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = (loss_sum / token_count).item()
+    bits_per_token = val_loss / math.log(2.0)
+    tokens_per_byte = token_count.item() / byte_count.item()
+    base_model.train()
+    return val_loss, bits_per_token * tokens_per_byte
+
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1406,6 +1488,10 @@ def main() -> None:
     if args.ema_decay > 0:
         ema_state = {name: tensor.detach().clone() for name, tensor in base_model.state_dict().items()}
 
+    # SWA: accumulator for checkpoint averaging
+    swa_state: dict[str, Tensor] | None = None
+    swa_count = 0
+
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1492,6 +1578,17 @@ def main() -> None:
                 for name, param in base_model.state_dict().items():
                     ema_state[name].lerp_(param.to(ema_state[name].dtype), 1.0 - args.ema_decay)
 
+        # SWA: collect checkpoints during warmdown for averaging
+        if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
+            if swa_state is None:
+                swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
+                swa_count = 1
+                log0(f"swa:start step:{step}")
+            else:
+                for name, t in base_model.state_dict().items():
+                    swa_state[name] += t.detach().cpu()
+                swa_count += 1
+
         should_log_train = (
             args.train_log_every > 0
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
@@ -1521,6 +1618,16 @@ def main() -> None:
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
+
+    # Apply SWA averaged weights if collected
+    if args.swa_enabled and swa_state is not None and swa_count > 1:
+        log0(f"swa:applying averaged {swa_count} checkpoints")
+        current_state = base_model.state_dict()
+        avg_state = {
+            name: (tensor / swa_count).to(dtype=current_state[name].dtype)
+            for name, tensor in swa_state.items()
+        }
+        base_model.load_state_dict(avg_state, strict=True)
 
     # Swap in EMA weights for serialization and evaluation
     if ema_state is not None:
@@ -1580,6 +1687,21 @@ def main() -> None:
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
+    if args.eval_stride > 0:
+        torch.cuda.synchronize()
+        t_slide = time.perf_counter()
+        q_val_loss_s, q_val_bpb_s = eval_val_sliding(
+            args, base_model, rank, world_size, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            stride=args.eval_stride,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_int8_zlib_sliding val_loss:{q_val_loss_s:.4f} val_bpb:{q_val_bpb_s:.4f} "
+            f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
+        )
+        log0(f"final_int8_zlib_sliding_exact val_loss:{q_val_loss_s:.8f} val_bpb:{q_val_bpb_s:.8f}")
+
     # --- Int6+zstd export (if zstandard is available) ---
     if _HAS_ZSTD:
         # Re-load the original (non-quantized) weights for int6 quantization
@@ -1630,6 +1752,21 @@ def main() -> None:
             f"eval_time:{1000.0 * (time.perf_counter() - t_q6eval):.0f}ms"
         )
         log0(f"final_int6_zstd_roundtrip_exact val_loss:{q6_val_loss:.8f} val_bpb:{q6_val_bpb:.8f}")
+
+        if args.eval_stride > 0:
+            torch.cuda.synchronize()
+            t_slide6 = time.perf_counter()
+            q6_val_loss_s, q6_val_bpb_s = eval_val_sliding(
+                args, base_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=args.eval_stride,
+            )
+            torch.cuda.synchronize()
+            log0(
+                f"final_int6_zstd_sliding val_loss:{q6_val_loss_s:.4f} val_bpb:{q6_val_bpb_s:.4f} "
+                f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_slide6):.0f}ms"
+            )
+            log0(f"final_int6_zstd_sliding_exact val_loss:{q6_val_loss_s:.8f} val_bpb:{q6_val_bpb_s:.8f}")
     else:
         log0("skipping int6+zstd export (zstandard not installed, pip install zstandard)")
 
